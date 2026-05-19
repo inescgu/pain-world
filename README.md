@@ -8,4 +8,4 @@ processing data for the ars electronica project
 4. hdi is super straightforward 
 5. climate trace requires a bunch of manual data downloading + reuploading, but runs fine as a notebook
 
-See [Methods] (https://docs.google.com/document/d/1qa8WMmJcrIFsm_2v8dbo-vTAX-0U3SisrYbNVgTglwQ/edit?usp=sharing)
+See Methods : https://docs.google.com/document/d/1qa8WMmJcrIFsm_2v8dbo-vTAX-0U3SisrYbNVgTglwQ/edit?usp=sharing
