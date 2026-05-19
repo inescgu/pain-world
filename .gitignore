@@ -11,6 +11,15 @@ __pycache__/
 # C extensions
 *.so
 
+# Data files
+*.tif
+*.gpkg
+worldpop_2020/
+hdi/
+
+# Logs
+slurm_logs/
+
 # Distribution / packaging
 .Python
 build/
