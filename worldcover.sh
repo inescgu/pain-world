@@ -3,9 +3,9 @@
 #SBATCH --output=slurm_logs/worldcover_%j.out
 #SBATCH --error=slurm_logs/worldcover_%j.err
 #SBATCH --time=24:00:00
-#SBATCH --mem=64G
+#SBATCH --mem=30G
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=1
 
 echo "Started at: $(date)"
 

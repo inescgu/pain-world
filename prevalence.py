@@ -3,8 +3,8 @@ import numpy as np
 import pathlib
 import warnings
 import argparse
+import gc
 
-# ── Configuration ──────────────────────────────────────────────────────────────
 TARGET_CONDITIONS = [
     "Low back pain",
     "Neck pain",
@@ -16,7 +16,6 @@ TARGET_CONDITIONS = [
     "Other musculoskeletal disorders",
 ]
 
-# ── ISO3 crosswalk (IHME location_name → ISO3) ─────────────────────────────────
 IHME_TO_ISO3: dict[str, str] = {
     "Afghanistan": "AFG", "Albania": "ALB", "Algeria": "DZA", "Andorra": "AND",
     "Angola": "AGO", "Antigua and Barbuda": "ATG", "Argentina": "ARG",
@@ -83,32 +82,42 @@ IHME_TO_ISO3: dict[str, str] = {
     "Zambia": "ZMB", "Zimbabwe": "ZWE",
 }
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Load & filter IHME
 # ══════════════════════════════════════════════════════════════════════════════
 def load_and_filter_ihme(path: str | pathlib.Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+
     df = df[
         (df["measure_name"] == "Prevalence")
-        & (df["sex_name"]    == "Both")
-        & (df["age_name"]    == "Age-standardized")
+        & (df["sex_name"]   == "Both")
+        & (df["age_name"]   == "Age-standardized")
     ].copy()
 
     if df.empty:
+        raw = pd.read_csv(path)
+        raw.columns = raw.columns.str.strip().str.lower().str.replace(" ", "_")
         raise ValueError(
-            "No rows remain after filtering. "
-            "Check measure_name / sex_name / age_name values in your CSV.\n"
-            f"Unique measure_name values : {pd.read_csv(path)['measure_name'].unique()}\n"
-            f"Unique sex_name values     : {pd.read_csv(path)['sex_name'].unique()}\n"
-            f"Unique age_name values     : {pd.read_csv(path)['age_name'].unique()}"
+            "No rows remain after filtering.\n"
+            f"  measure_name unique: {raw['measure_name'].unique()}\n"
+            f"  sex_name unique    : {raw['sex_name'].unique()}\n"
+            f"  age_name unique    : {raw['age_name'].unique()}"
         )
 
     df["iso3"] = df["location_name"].map(IHME_TO_ISO3)
-    unmatched = df[df["iso3"].isna()]["location_name"].unique()
+    unmatched  = df[df["iso3"].isna()]["location_name"].unique()
     if len(unmatched):
         warnings.warn(f"[ISO3] No match for: {unmatched}")
+
+    # ── shrink dtypes early ───────────────────────────────────────────────────
+    for col in ["val", "upper", "lower"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
+    for col in ["location_name", "cause_name", "metric_name",
+                "measure_name", "sex_name", "age_name", "iso3"]:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
 
     print(
         f"[IHME] {len(df):,} rows after filter "
@@ -117,7 +126,6 @@ def load_and_filter_ihme(path: str | pathlib.Path) -> pd.DataFrame:
     )
     return df.reset_index(drop=True)
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2 — Impute missing val / upper / lower
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,19 +133,20 @@ def impute(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["imputed"]        = False
     df["imputed_fields"] = ""
+
     GRP = ["cause_name", "metric_name", "year"]
 
     # val from midpoint of bounds
     m = df["val"].isna() & df["upper"].notna() & df["lower"].notna()
-    df.loc[m, "val"]            = (df.loc[m, "upper"] + df.loc[m, "lower"]) / 2
-    df.loc[m, "imputed"]        = True
+    df.loc[m, "val"]             = (df.loc[m, "upper"] + df.loc[m, "lower"]) / 2
+    df.loc[m, "imputed"]         = True
     df.loc[m, "imputed_fields"] += "val(midpoint);"
 
     # bounds from val via group-median ratio
     df["_ru"] = np.where(df["val"] > 0, df["upper"] / df["val"], np.nan)
     df["_rl"] = np.where(df["val"] > 0, df["lower"] / df["val"], np.nan)
-    df["_mru"] = df.groupby(GRP)["_ru"].transform("median")
-    df["_mrl"] = df.groupby(GRP)["_rl"].transform("median")
+    df["_mru"] = df.groupby(GRP, observed=True)["_ru"].transform("median")
+    df["_mrl"] = df.groupby(GRP, observed=True)["_rl"].transform("median")
 
     mu = df["upper"].isna() & df["val"].notna()
     df.loc[mu, "upper"]          = df.loc[mu, "val"] * df.loc[mu, "_mru"]
@@ -150,7 +159,7 @@ def impute(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[ml, "imputed_fields"] += "lower(ratio);"
 
     # val from group median
-    df["_gm"] = df.groupby(GRP)["val"].transform("median")
+    df["_gm"] = df.groupby(GRP, observed=True)["val"].transform("median")
     mv = df["val"].isna()
     df.loc[mv, "val"]            = df.loc[mv, "_gm"]
     df.loc[mv, "imputed"]        = True
@@ -168,7 +177,6 @@ def impute(df: pd.DataFrame) -> pd.DataFrame:
     print(f"[IMPUTE] {df['imputed'].sum():,} rows imputed")
     return df
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Compute national absolute prevalence counts
 # ══════════════════════════════════════════════════════════════════════════════
@@ -176,10 +184,15 @@ def compute_national_absolute(
     df: pd.DataFrame,
     country_pop: pd.DataFrame,
 ) -> pd.DataFrame:
-    df = df.merge(
-        country_pop[["iso3", "total_population"]],
-        on="iso3", how="left"
-    )
+
+    # country_pop iso3 may be category; align types before merge
+    country_pop = country_pop.copy()
+    country_pop["iso3"] = country_pop["iso3"].astype(str)
+    df = df.copy()
+    df["iso3"] = df["iso3"].astype(str)
+
+    df = df.merge(country_pop[["iso3", "total_population"]], on="iso3", how="left")
+
     missing_pop = df["total_population"].isna().sum()
     if missing_pop:
         warnings.warn(
@@ -187,13 +200,13 @@ def compute_national_absolute(
         )
 
     def _convert(col: str) -> pd.Series:
-        out = pd.Series(np.nan, index=df.index)
+        out = pd.Series(np.nan, index=df.index, dtype=np.float64)
         n   = df["metric_name"] == "Number"
         r   = df["metric_name"] == "Rate"
         p   = df["metric_name"] == "Percent"
-        out[n] = df.loc[n, col]
-        out[r] = (df.loc[r, col] / 100_000) * df.loc[r, "total_population"]
-        out[p] = (df.loc[p, col] / 100)     * df.loc[p, "total_population"]
+        out[n] = df.loc[n, col].astype(np.float64)
+        out[r] = (df.loc[r, col].astype(np.float64) / 100_000) * df.loc[r, "total_population"]
+        out[p] = (df.loc[p, col].astype(np.float64) / 100)     * df.loc[p, "total_population"]
         return out
 
     df["abs_val"]   = _convert("val")
@@ -202,33 +215,59 @@ def compute_national_absolute(
 
     print("[NATIONAL] Absolute counts computed.")
     print(
-        df.groupby("cause_name")[["abs_val"]]
-        .sum().sort_values("abs_val", ascending=False)
+        df.groupby("cause_name", observed=True)[["abs_val"]]
+        .sum()
+        .sort_values("abs_val", ascending=False)
         .to_string()
     )
     return df
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 4 — Load WorldPop pixel file & aggregate to country totals
 # ══════════════════════════════════════════════════════════════════════════════
 def load_worldpop(path: str | pathlib.Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Reads the WorldPop CSV in chunks so the OS never needs to hold
+    the entire raw text in memory at once, then downcasts aggressively.
+    """
     print(f"[WORLDPOP] Reading {path} …")
-    pixels = pd.read_csv(path, usecols=["iso3", "lat", "lon", "pop_density"])
-    pixels = pixels[pixels["pop_density"] > 0].copy()
+
+    chunks = []
+    for chunk in pd.read_csv(
+        path,
+        usecols=["iso3", "lat", "lon", "pop_density"],
+        chunksize=500_000,   # ≈ tune to taste; 500k rows ≈ ~20 MB per chunk
+        dtype={
+            "iso3":        "category",
+            "lat":         np.float32,
+            "lon":         np.float32,
+            "pop_density": np.float32,
+        },
+    ):
+        chunk = chunk[chunk["pop_density"] > 0]
+        chunks.append(chunk)
+
+    pixels = pd.concat(chunks, ignore_index=True)
+    del chunks
+    gc.collect()
+
+    # Re-encode iso3 as category after concat (concat can un-categorise)
+    pixels["iso3"] = pixels["iso3"].astype("category")
 
     country_pop = (
-        pixels.groupby("iso3", sort=True)["pop_density"]
+        pixels.groupby("iso3", sort=True, observed=True)["pop_density"]
         .sum()
         .reset_index()
         .rename(columns={"pop_density": "total_population"})
     )
+    # total_population stays float32 — upcast for safety in multiplications
+    country_pop["total_population"] = country_pop["total_population"].astype(np.float64)
+
     print(
         f"[WORLDPOP] {len(pixels):,} valid pixels | "
         f"{len(country_pop):,} countries"
     )
     return pixels, country_pop
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 5 — Distribute national burden to pixels
@@ -236,7 +275,17 @@ def load_worldpop(path: str | pathlib.Path) -> tuple[pd.DataFrame, pd.DataFrame]
 def distribute_to_pixels(
     national: pd.DataFrame,
     pixels: pd.DataFrame,
-) -> pd.DataFrame:
+    output_dir: pathlib.Path,
+) -> tuple[pathlib.Path, int]:
+    """
+    Streams one cause at a time to CSV.
+    Returns (path_to_csv, total_rows_written).
+
+    FIX vs original:
+      • No longer returns a DataFrame (avoids holding all pixel×cause in RAM).
+      • Tracks row count so caller can report it.
+      • Drops pixel_share before writing to keep file slim.
+    """
     nat_slim = national[[
         "iso3", "cause_name",
         "abs_val", "abs_upper", "abs_lower",
@@ -244,23 +293,42 @@ def distribute_to_pixels(
         "imputed", "imputed_fields",
     ]].dropna(subset=["abs_val"]).copy()
 
-    print("[DISTRIBUTE] Merging pixels × causes …")
-    merged = pixels.merge(nat_slim, on="iso3", how="inner")
+    # iso3 alignment
+    nat_slim["iso3"] = nat_slim["iso3"].astype(str)
+    pixels = pixels.copy()
+    pixels["iso3"]   = pixels["iso3"].astype(str)
+    nat_slim = nat_slim[nat_slim["cause_name"].isin(TARGET_CONDITIONS)]
+    
+    causes     = nat_slim["cause_name"].unique()
+    out_path   = output_dir / "prevalence_by_pixel.csv"
+    first      = True
+    total_rows = 0
 
-    merged["pixel_share"]          = merged["pop_density"] / merged["total_population"]
-    merged["pixel_abs_prevalence"] = merged["pixel_share"] * merged["abs_val"]
-    merged["pixel_abs_upper"]      = merged["pixel_share"] * merged["abs_upper"]
-    merged["pixel_abs_lower"]      = merged["pixel_share"] * merged["abs_lower"]
+    print(f"[DISTRIBUTE] Processing {len(causes)} causes one at a time …")
 
-    merged.drop(columns=["pixel_share", "total_population"], inplace=True)
+    for cause in causes:
+        print(f"  → {cause}")
+        nat_cause = nat_slim[nat_slim["cause_name"] == cause]
 
-    print(
-        f"[DISTRIBUTE] Output: {len(merged):,} rows "
-        f"({pixels['iso3'].nunique()} countries × "
-        f"{nat_slim['cause_name'].nunique()} causes)"
-    )
-    return merged.reset_index(drop=True)
+        merged = pixels.merge(nat_cause, on="iso3", how="inner")
+        merged["pixel_share"]          = merged["pop_density"] / merged["total_population"]
+        merged["pixel_abs_prevalence"] = merged["pixel_share"] * merged["abs_val"]
+        merged["pixel_abs_upper"]      = merged["pixel_share"] * merged["abs_upper"]
+        merged["pixel_abs_lower"]      = merged["pixel_share"] * merged["abs_lower"]
+        merged.drop(columns=["pixel_share", "total_population"], inplace=True)
 
+        total_rows += len(merged)
+        keep_cols = ["iso3", "lat", "lon", "cause_name",
+             "pixel_abs_prevalence", "pixel_abs_upper", "pixel_abs_lower"]
+        merged[keep_cols].to_csv(out_path, mode="a", header=first, index=False,
+              compression="gzip")  # change out_path extension to .csv.gz
+        first = False
+
+        del merged
+        gc.collect()
+
+    print(f"[DISTRIBUTE] Written to {out_path}  ({total_rows:,} rows)")
+    return out_path, total_rows
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 6 — Master pipeline
@@ -269,8 +337,7 @@ def run_pipeline(
     ihme_path:     str | pathlib.Path,
     worldpop_path: str | pathlib.Path,
     output_dir:    str | pathlib.Path = "output",
-) -> dict[str, pd.DataFrame]:
-
+) -> dict:
     output_dir = pathlib.Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
@@ -278,14 +345,14 @@ def run_pipeline(
     ihme                = load_and_filter_ihme(ihme_path)
     ihme                = impute(ihme)
     national            = compute_national_absolute(ihme, country_pop)
-    pixel_burden        = distribute_to_pixels(national, pixels)
 
-    # Save outputs
-    out_pixels   = output_dir / "prevalence_by_pixel.csv"
+    # ── free IHME raw now that national is computed ───────────────────────────
+    del ihme
+    gc.collect()
+
+    # ── save national & imputed log BEFORE distributing to pixels ────────────
     out_national = output_dir / "prevalence_national.csv"
     out_imputed  = output_dir / "imputed_log.csv"
-
-    pixel_burden.to_csv(out_pixels, index=False)
 
     national[[
         "location_name", "iso3", "cause_name",
@@ -295,26 +362,31 @@ def run_pipeline(
 
     national[national["imputed"]].to_csv(out_imputed, index=False)
 
+    # ── pixel distribution (streaming — no giant DataFrame returned) ──────────
+    out_pixels, pixel_row_count = distribute_to_pixels(national, pixels, output_dir)
+
     print(f"\n[DONE] Written to {output_dir}/")
-    print(f"  prevalence_by_pixel.csv  : {len(pixel_burden):,} rows")
-    print(f"  prevalence_national.csv  : {len(national):,} rows")
-    print(f"  imputed_log.csv          : {national['imputed'].sum():,} rows")
+    print(f"  prevalence_by_pixel.csv : {pixel_row_count:,} rows")
+    print(f"  prevalence_national.csv : {len(national):,} rows")
+    print(f"  imputed_log.csv         : {national['imputed'].sum():,} rows")
 
     return {
-        "pixel_burden": pixel_burden,
+        "pixel_csv":    out_pixels,
         "national":     national,
         "country_pop":  country_pop,
+        "pixel_rows":   pixel_row_count,
     }
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IHME × WorldPop prevalence pipeline")
-    parser.add_argument("--ihme",      required=True,  help="Path to IHME CSV file")
-    parser.add_argument("--worldpop",  required=True,  help="Path to WorldPop pixel CSV file")
-    parser.add_argument("--output",    default="output", help="Output directory (default: output)")
+    parser = argparse.ArgumentParser(
+        description="IHME × WorldPop prevalence pipeline"
+    )
+    parser.add_argument("--ihme",     required=True,    help="Path to IHME CSV")
+    parser.add_argument("--worldpop", required=True,    help="Path to WorldPop pixel CSV")
+    parser.add_argument("--output",   default="output", help="Output directory")
     args = parser.parse_args()
 
     run_pipeline(
